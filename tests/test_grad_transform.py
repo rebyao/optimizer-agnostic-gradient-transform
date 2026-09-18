@@ -179,6 +179,7 @@ class TestMultiParamGroup:
 
         _backward_pass(model, x, y)
         original_grads = {p: p.grad.clone() for p in model.parameters()}
+        original_params = {p: p.detach().clone() for p in model.parameters()}
 
         step_with_transformed_gradients(opt, signed_square)
 
@@ -186,5 +187,28 @@ class TestMultiParamGroup:
         for p, original in original_grads.items():
             assert torch.equal(p.grad, original)
 
-        # Sanity check: both groups actually received updates (params changed).
-        assert len(opt.param_groups) == 2
+        # Check each group's transformed SGD update at its own learning rate.
+        for group in opt.param_groups:
+            for p in group["params"]:
+                g = original_grads[p]
+                expected = original_params[p] - group["lr"] * g * g.abs()
+                torch.testing.assert_close(p, expected)
+
+
+def test_closure_recomputed_gradient_bypasses_transform():
+    p = nn.Parameter(torch.tensor([1.0], dtype=torch.float64))
+    original = torch.tensor([2.0], dtype=torch.float64)
+    p.grad = original.clone()
+    optimizer = torch.optim.SGD([p], lr=0.125)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = (3.0 * p).sum()
+        loss.backward()
+        return loss
+
+    step_with_transformed_gradients(optimizer, signed_square, closure=closure)
+
+    # The closure replaces the transformed gradient with 3, not T(3) = 9.
+    torch.testing.assert_close(p, torch.tensor([0.625], dtype=p.dtype), rtol=0, atol=0)
+    torch.testing.assert_close(p.grad, original, rtol=0, atol=0)

@@ -38,9 +38,10 @@ interface:
   multiple param groups).
 - `optimizer.step()` to perform the actual update.
 
-Because `p.grad` is the only thing being swapped, any optimizer that reads
-`p.grad` during `step()` - SGD, AdamW, Adam, RMSprop, custom optimizers,
-etc. - is transparently supported without special-casing.
+Because `p.grad` is the only thing being swapped, the wrapper does not need
+optimizer-specific update rules. This assumes `step()` directly consumes
+the current `p.grad`, as in ordinary SGD and AdamW usage. Optimizers that
+recompute gradients inside `step()` require additional integration.
 
 ## Usage
 
@@ -64,6 +65,18 @@ step_with_transformed_gradients(optimizer, signed_square)
 
 ## Running the tests
 
+For a small deterministic CPU validation of SGD and AdamW, run:
+
+```bash
+python validate.py
+```
+
+This uses fixed parameter tensors and manually assigned gradients, compares
+each update with a native optimizer given `g * abs(g)` directly, and checks
+exact restoration of the original gradient values after every step.
+
+For the full test suite:
+
 ```bash
 pip install pytest torch
 pytest -q
@@ -85,6 +98,8 @@ Test coverage (`tests/test_grad_transform.py`):
 - Exception safety: if `optimizer.step()` raises, gradients are still fully
   restored.
 - Multiple parameter groups are all transformed and restored correctly.
+- A closure that recomputes gradients bypasses the transformation, while
+  the pre-step gradient values are still restored.
 
 ## Mini example / benchmark
 
@@ -95,21 +110,22 @@ python benchmark.py  # baseline optimizer.step() vs. wrapper overhead
 
 ## Time / memory complexity
 
-Let `N` = total number of elements across all gradient tensors.
+Let `N` be the total number of elements in non-None gradients.
 
-- Transformation (`transform_fn`): `O(N)` time, and for `signed_square`
-  specifically `O(N)` extra memory (it allocates a new tensor: `g * g.abs()`).
-- Backup (clone) and restore: `O(N)` time and `O(N)` extra memory for the
-  cloned originals.
-- Overall: `O(N)` time and `O(N)` extra memory beyond the model's normal
-  gradient buffers.
+- For `signed_square`, cloning and transformation add `O(N)` time beyond
+  the optimizer's own step, plus Python iteration over parameters.
+  Restoration reassigns saved tensor references; it does not copy elements.
+- Additional tensor space is `O(N)`. This clone-based restoration strategy
+  requires at least one full gradient copy to preserve the original values.
+  Transformed gradients also occupy storage, and `g * g.abs()` creates an
+  additional temporary tensor for `abs(g)` while each gradient is processed.
+- Peak memory is not a fixed number of gradient-sized buffers: it depends
+  on tensor lifetimes, external references, and allocator behavior. The
+  optimizer's own state and temporary allocations are separate costs.
 
-Because the wrapper keeps both the cloned original gradient *and* the
-transformed gradient alive at the same time (plus whatever the optimizer
-itself allocates, e.g. AdamW's `exp_avg`/`exp_avg_sq` state), peak memory
-during a step can exceed one full copy of the gradients - roughly two extra
-gradient-sized buffers (original + transformed) on top of the optimizer's
-own state.
+These bounds apply to the included transform; an arbitrary `transform_fn`
+can have different costs. `benchmark.py` measures CPU timing overhead, which
+depends on tensor sizes and the optimizer.
 
 ## Conceptual scope
 
@@ -123,9 +139,17 @@ staleness-aware logic is implemented here.
 
 ## Limitations / explicitly out of scope
 
+- `optimizer.step()` must directly use the current `p.grad`. If it
+  recomputes gradients internally through a closure, those new gradients
+  bypass the transformation, so closure-based optimizers are not guaranteed
+  to work without additional integration.
+- Transforms must not mutate their input or return an alias that can mutate
+  the saved backup. Restoration preserves gradient values, not the original
+  gradient tensor's object identity.
 - No asynchronous / RLVR-style staleness correction.
 - No distributed training, FSDP, or ZeRO support.
-- No sparse gradient support.
+- Sparse gradients are untested; there is no explicit sparse-layout
+  handling or rejection, so sparse support is not guaranteed.
 - No AMP / `GradScaler` integration.
 - No GPU benchmarking (CPU-only benchmark included).
 
@@ -165,13 +189,11 @@ python experiments/direction_consistency_study.py
 
 ## Known risk areas (aliasing, restore, optimizer assumptions)
 
-- **Tensor aliasing**: the original gradient is `clone()`d *before* any
-  transform is applied or assigned back to `p.grad`, so an in-place-style
-  transform (or an optimizer that mutates `p.grad` in place) cannot corrupt
-  the saved original. As an extra guard, if `transform_fn` returns the exact
-  same tensor object it was given (e.g. a no-op transform), the wrapper
-  clones it again before assigning to `p.grad`, so the saved original and
-  the live gradient are never the same object.
+- **Tensor aliasing**: the transform receives the saved gradient clone,
+  so it must not mutate that input. The included `signed_square` returns
+  a new tensor. If a transform returns its input unchanged, the wrapper
+  clones it before assigning to `p.grad`; this guard does not protect
+  against input mutation or other shared-storage views.
 - **Restore is `try`/`finally`**: gradients are restored even if
   `optimizer.step()` raises.
 - **AdamW / optimizer state**: the wrapper does not touch optimizer state
@@ -179,6 +201,7 @@ python experiments/direction_consistency_study.py
   swaps `p.grad` before calling `step()`. The AdamW reference-equivalence
   test confirms optimizer state ends up consistent with what native AdamW
   would produce given the transformed gradient.
-- **Optimizer-specific assumptions**: none. The wrapper only reads
-  `optimizer.param_groups` and calls `optimizer.step()`, so it makes no
-  assumptions about a specific optimizer's update rule.
+- **Optimizer assumptions**: no specific update rule is reimplemented,
+  but `step()` must consume the current `p.grad` without recomputing it.
+  Forwarding a closure does not ensure that closure-generated gradients
+  receive the transformation.

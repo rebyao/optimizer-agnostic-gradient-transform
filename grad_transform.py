@@ -6,9 +6,9 @@ optimizer step against the transformed gradients, and then restore the
 original gradients afterwards.
 
 The mechanism only relies on the standard PyTorch optimizer interface
-(``optimizer.param_groups`` and ``optimizer.step()``), so it works with any
-``torch.optim.Optimizer`` subclass without reimplementing optimizer-specific
-update rules.
+(``optimizer.param_groups`` and ``optimizer.step()``), without reimplementing
+optimizer-specific update rules. It assumes step() consumes the current
+p.grad; gradients recomputed inside a closure are not transformed.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def step_with_transformed_gradients(
     gradient is fabricated for them).
 
     Args:
-        optimizer: Any ``torch.optim.Optimizer`` instance.
+        optimizer: An optimizer that consumes the current ``p.grad``.
         transform_fn: Callable mapping an original gradient tensor to a
             transformed gradient tensor, e.g. ``signed_square``.
         *args, **kwargs: Forwarded to ``optimizer.step()``.
@@ -67,8 +67,7 @@ def step_with_transformed_gradients(
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                # Clone BEFORE any in-place mutation so `original` cannot
-                # alias the tensor we are about to transform.
+                # Save a separate copy; transform_fn must not mutate it.
                 original = p.grad.clone()
                 saved_grads.append((p, original))
                 transformed = transform_fn(original)
