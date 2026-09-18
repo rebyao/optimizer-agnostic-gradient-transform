@@ -132,6 +132,37 @@ staleness-aware logic is implemented here.
 These are intentionally left out to keep the mechanism focused on
 correctness and testability of gradient interception itself.
 
+## Experiments
+
+`experiments/` holds standalone research/benchmark scripts. None of them are
+imported by, or modify, `grad_transform.py` - the production
+`step_with_transformed_gradients` mechanism above is untouched by all of
+them. Each is run directly, with no CLI arguments:
+
+```bash
+python experiments/reversible_tradeoff.py
+python experiments/scale_study.py
+python experiments/direction_consistency_study.py
+```
+
+- **`reversible_tradeoff.py`** - Compares the default safe (clone-based)
+  gradient restoration against a reversible, in-place alternative that
+  exploits `T(g) = sign(g) * g^2` being invertible
+  (`T^-1(x) = sign(x) * sqrt(abs(x))`). Breaks down timing per component
+  (clone/transform/step/restore vs. forward_transform/step/inverse_restore),
+  measures both total and per-parameter peak memory, and rigorously tests
+  round-trip precision (exhaustive over all float16/bfloat16 bit patterns;
+  sampled + edge-case testing for float32).
+- **`scale_study.py`** - Extends the safe-vs-reversible comparison across
+  gradient sizes from ~0.2 MB to hundreds of MB, to check whether the
+  timing/memory tradeoffs seen at small scale still hold once operations
+  become memory-bandwidth-bound rather than dispatch-overhead-bound.
+- **`direction_consistency_study.py`** - Observation-only research script
+  asking whether a stale gradient's *directional consistency* (cosine
+  similarity to a current/reference gradient) predicts its usefulness
+  better than its *age* does. Reports measurements only; it does not
+  implement any gradient reweighting or staleness-mitigation algorithm.
+
 ## Known risk areas (aliasing, restore, optimizer assumptions)
 
 - **Tensor aliasing**: the original gradient is `clone()`d *before* any
